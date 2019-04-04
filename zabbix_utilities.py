@@ -33,6 +33,29 @@ class PythonUtility:
 
         return out, err
 
+    def write_to_csv(self, filepath, data, headers):
+        with open(filepath, "w", newline='') as csv_file:
+            writer = csv.writer(csv_file, delimiter=',')
+            writer.writerow(headers)
+            for line in data:
+                writer.writerow(line.split(','))
+    
+    def parse_csv_into_ouput(self, filepath, output, method_of_processing_into_output):
+        with open(filepath, 'r') as csv_file:
+            file_lines = csv.reader(csv_file, delimiter=',')
+            for row in file_lines:
+                method_of_processing_into_output(row, output)
+        return output
+
+    def parse_debug_argument(self):
+        parser = argparse.ArgumentParser()
+        parser.add_argument('-debug', action='store_true', help='Run in debug')
+        args = parser.parse_args()
+
+        if args.debug:
+            return True
+        return False
+
 #############################################################################
 # Twilio
 # Send an sms to any number from the assigned number 
