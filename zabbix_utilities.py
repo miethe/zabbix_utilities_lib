@@ -1,15 +1,17 @@
 #############################################################################
-# 
-# Nick Miethe 2/2019
+#
+# Nick Miethe 2/2019, SAS Institute
 #
 # This is meant to be used as a library to be imported into any given script.
-# Included are some of the more common functions used for Zabbix support scripts.
-# 
+# Included are some of the more common functions used for Zabbix scripts.
+#
+#
 #
 #############################################################################
 
 from pyzabbix import ZabbixAPI
 from pyzabbix import ZabbixAPIException
+from pyzabbix import ZabbixSender, ZabbixMetric
 import jibbix
 import logging
 import zabbix_secret
@@ -17,9 +19,22 @@ from twilio.rest import Client
 import pyodbc
 import subprocess
 import urllib
+import csv
+import argparse
+import time
+import os.path
 
 #############################################################################
-# Python Utilities
+# Default Variables: Put your default environment variables here.
+#############################################################################
+
+class UtilityPaths:
+
+    LOGGING_PATH = './'
+    KILL_SWITCH = './KILL_AUTOMATION.SIGNAL'
+
+#############################################################################
+# Python Utilities:
 # Common or complex functions used frequently in scripts.
 #############################################################################
 
@@ -39,7 +54,7 @@ class PythonUtility:
             writer.writerow(headers)
             for line in data:
                 writer.writerow(line.split(','))
-    
+
     def parse_csv_into_ouput(self, filepath, output, method_of_processing_into_output):
         with open(filepath, 'r') as csv_file:
             file_lines = csv.reader(csv_file, delimiter=',')
@@ -56,12 +71,32 @@ class PythonUtility:
             return True
         return False
 
+    def is_ip(self, s):
+        a = s.split('.')
+        if len(a) != 4:
+            return False
+        for x in a:
+            if not x.isdigit():
+                return False
+            i = int(x)
+            if i < 0 or i > 255:
+                return False
+        return True
+
 #############################################################################
-# Twilio
-# Send an sms to any number from the assigned number 
+# Twilio section:
+# Send an sms to any number from the assigned number +19192835610
 #############################################################################
 
 class TwilioUtility:
+
+    logger = None
+
+    def __init__(self, logger_path = None):
+        if logger_path:
+            self.logger = LoggerUtility('Twilio Utility Logs', logger_path).get_logger()
+        else:
+            self.logger = LoggerUtility().get_logger()
 
     def send_sms(self, message, recipient):
 
@@ -77,27 +112,27 @@ class TwilioUtility:
                         from_=ASSIGNED_PHONENUMBER,
                         to=recipient
                 )
-        logger = LoggerUtility().get_logger()
-        logger.info('Message sent to %s: %s' % (recipient, message))
-        logger.info('Response: %s' % response.sid)
+
+        self.logger.info('Message sent to %s: %s' % (recipient, message))
+        self.logger.info('Response: %s' % response.sid)
 
 #############################################################################
-# Logging section
+# Logging section:
 # All logging in the class is included in the log file of the calling
-# class. 
+# class.
 # If no logger exists, one will be created as default_util.log.
 #############################################################################
 
 class LoggerUtility:
-    """It is important that Logger be created before calling any other functions if logging is desired 
+    """It is important that Logger be created before calling any other functions if logging is desired
         or else the logs will all file into default_util.log."""
     lib_logger = None
 
-    def __init__(self, name = 'Default Util Log', filepath = './default_util.log'):
+    def __init__(self, filepath = (UtilityPaths().LOGGING_PATH+'default_util.log'), name = 'Default Util Log'):
         if self.lib_logger is None:
-            self._create_logger(name, filepath)
+            self.__create_logger(name, filepath)
 
-    def _create_logger(self, name, filepath):
+    def __create_logger(self, name, filepath):
         log_file = filepath
         logger = logging.getLogger(name)
         logger.setLevel(logging.INFO)
@@ -105,7 +140,7 @@ class LoggerUtility:
         logger_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
         logging_handler.setFormatter(logger_formatter)
         logger.addHandler(logging_handler)
-        
+
         self.lib_logger = logger
 
     # this should be used to create a local parameter rather than using the global logger.
@@ -113,43 +148,86 @@ class LoggerUtility:
         return self.lib_logger
 
 #############################################################################
-# PyZabbix section
+# PyZabbix section: Common scripts to interface with PyZabbix, including
+# API request. This is where scripts will directly interface with Zabbix.
 #############################################################################
 
 class PyZabbixUtility:
 
+    py_zapi = None
+    logger = None
+
+    def __init__(self, critical = False):
+        self.logger = LoggerUtility().get_logger()
+        if not critical and os.path.exists(UtilityPaths().KILL_SWITCH):
+            print('Kill switch activated, exiting.')
+            exit(1)
+
+    def set_zapi_auth(self, url, user, passwd):
+        try:
+            self.py_zapi = ZabbixAPI(url=url, user=user, password=passwd)
+        except ZabbixAPIException:
+            self.logger.warning('URL or Login is incorrect')
+            raise
+
     def api_request(self, function, json):
         # jsonrpc and ID are auto appended by ZabbixAPI
-        logger = LoggerUtility().get_logger()
+        result = self.__retrieve_zapi()
+        if not result:
+            return None
 
-        logger.info("Calling function %s" % function)
+        return self.__execute_request(function, json)
+
+    def __retrieve_zapi(self):
+        # try to retrieve zapi and handle issues that arise
         try:
-            zapi = ZabbixAPI(url=zabbix_secret.ZABBIX_URL, \
-                user=zabbix_secret.AUTH_USER, password=zabbix_secret.AUTH_PASSWORD)
+            if self.py_zapi is None:
+                self.py_zapi = ZabbixAPI(url=zabbix_secret.ZABBIX_URL_BACKUP1, \
+                    user=zabbix_secret.AUTH_USER, password=zabbix_secret.AUTH_PASSWORD)
+        # If we fail here with an APIException, we likely have an incorrect login.
         except ZabbixAPIException:
-            logger.warning('URL or Login is incorrect')
+            self.logger.warning('URL or Login is incorrect')
             raise
+        # if the primary api endpoint fails, try the backups.
         except urllib2.HTTPError as err:
             if err.code == 503:
                 url_try = 0
                 urls = [zabbix_secret.ZABBIX_URL_BACKUP1, zabbix_secret.ZABBIX_URL_BACKUP2, zabbix_secret.ZABBIX_URL_BACKUP3]
                 while url_try<=len(urls):
-                    logger.warning(zabbix_secret.ZABBIX_URL + ' is not responding, trying: ' + urls[url_try])
+                    self.logger.warning(zabbix_secret.ZABBIX_URL + ' is not responding, trying: ' + urls[url_try])
                     try:
-                        zapi = ZabbixAPI(url=urls[url_try], \
+                        self.py_zapi = ZabbixAPI(url=urls[url_try], \
                             user=zabbix_secret.AUTH_USER, password=zabbix_secret.AUTH_PASSWORD)
                     except urllib2.HTTPError:
                         url_try+=1
                         continue
                     break
+        except Exception as e:
+            self.logger.error(e)
+            return None
+        return self.py_zapi
 
-
+    def __execute_request(self, function, json):
         try:
-            response = zapi.do_request(function, json)['result']
+            response = self.py_zapi.do_request(function, json)['result']
             return response
         except ZabbixAPIException:
-            logger.error("Trouble executing following function: " + function)
+            self.logger.error("Trouble executing following function: " + function)
             raise
+        except urllib2.HTTPError as err:
+            if err.code == 502:
+                try_count = 0
+                while try_count < 1:
+                    try:
+                        response = self.py_zapi.do_request(function, json)['result']
+                        return response
+                    except:
+                        try_count +=1
+            self.logger.error(err)
+            return None
+        except Exception as e:
+            self.logger.error(e)
+            return None
 
     def create_hostgroup(self, name):
         function = 'hostgroup.create'
@@ -188,6 +266,11 @@ class PyZabbixUtility:
         json = {'filter':{'host':[names]}}
         return self.api_request(function, json)
 
+    def get_hosts_by_hostgroups(self, hostgroups):
+        function = 'host.get'
+        json = {'groupids':[hostgroups]}
+        return self.api_request(function, json)
+
     def get_maintenance_by_name(self, name):
         function = "maintenance.get"
         json = {'output':'extend', 'filter':{'name':name}}
@@ -199,10 +282,15 @@ class PyZabbixUtility:
         return self.api_request(function, json)[0]['maintenanceid']
 
 #############################################################################
-# Jira section
+# Jira section: Common scripts to interface with Jira
 #############################################################################
 
 class JiraUtility:
+
+    logger = None
+
+    def __init__(self):
+        self.logger = LoggerUtility().get_logger()
 
     class Jira_Object:
         summary = ''
@@ -221,31 +309,87 @@ class JiraUtility:
             self.description = description
 
     def create_jira_ticket(self, jira_object):
-        logger = LoggerUtility().get_logger()
-        
         info = jibbix.Info()
         info.summary  = jira_object.summary
         info.project  = jira_object.project
         info.owner = jira_object.owner
-        
+
         info.assignee = jira_object.assignee
         info.priority = jira_object.priority
         info.description = jira_object.description
-        
-        jira = jibbix.open_ticket(info)
 
-        logger.info("jibbix.open_ticket returns %s" % jira.key)
-
-        return jira.key
+        try:
+            jira = jibbix.open_ticket(info)
+            self.logger.info("jibbix.open_ticket returns %s" % jira.key)
+            return jira.key
+        except Exception as e:
+            self.logger.error(e)
+            return None
 
     def add_jira_comment(self, key, comment):
         info = jibbix.Info()
         info.link = key
         info.description = comment
-        return jibbix.comment_only(info)
+        try:
+            return jibbix.comment_only(info)
+        except Exception as e:
+            self.logger.error(e)
+            return None
+
+#############################################################################
+# Test Suite section: Tests for various purposes
+#############################################################################
+
+class TestUtility:
+
+    pyZabbix = None
+    logger = None
+
+    test_host = ''
+
+    def __init__(self):
+        self.logger = LoggerUtility().get_logger()
+        self.pyZabbix = PyZabbixUtility()
+
+    def test_compilation(self):
+        try:
+            print('I compile fine, thanks!')
+        except Exception as e:
+            print('I ran into an error whilst compiling, sorry!')
+            print(e)
+
+    def test_api(self, send_data = True):
+
+        start_time = time.time()
+
+        # Do a basic test of the api, getting the automation host
+        try:
+            function = 'host.get'
+            json = {'filter':{'host':self.test_host}}
+            self.pyZabbix.api_request(function, json)
+        except:
+            self.logger.error('Failed API Test')
+
+        final_time = time.time()-start_time
+
+        if send_data: self.__send_api_data(final_time)
+        else: return final_time
+
+    def __send_api_data(self, final_time):
+        key = 'api.test'
+        host = self.test_host
+        value = float(final_time)
+
+        metrics = []
+        metric = ZabbixMetric(host, key, value)
+        metrics.append(metric)
+
+        zbx = ZabbixSender('', 10051)
+        return(zbx.send(metrics))
 
 #############################################################################
 # For testing a purposes, an available main class
 #############################################################################
+
 if __name__ == '__main__':
-    print('I compile fine, thanks.')
+    print(TestUtility().test_api(False))
